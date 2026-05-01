@@ -5,10 +5,10 @@ import numpy as np
 import torch
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.configs.camera_configs import RBY1GoProD455CameraSystem
-from molmo_spaces.configs.robot_configs import FrankaRobotConfig, RBY1MConfig
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
-from molmo_spaces.policy.base_policy import InferencePolicy, StatefulPolicy
+from molmo_spaces.configs.robot_configs import FrankaRobotConfig, RBY1MConfig
 from molmo_spaces.evaluation.configs.evaluation_configs import JsonBenchmarkEvalConfig
+from molmo_spaces.policy.base_policy import InferencePolicy, StatefulPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ class SynthVLAPolicy(InferencePolicy, StatefulPolicy):
         self.action_horizon = config.policy_config.action_horizon
         self.execute_horizon = config.policy_config.execute_horizon
         self.action_type = config.policy_config.action_type
+        self.clamp_gripper = config.policy_config.clamp_gripper
         self.relative_max_joint_delta = config.policy_config.relative_max_joint_delta
         if self.relative_max_joint_delta is not None:
             self.relative_max_joint_delta = np.array(self.relative_max_joint_delta)
@@ -228,7 +229,7 @@ class SynthVLAPolicyConfig(BasePolicyConfig):
 
     policy_type: str = "learned"
     action_type: str = "joint_pos_rel"
-    policy_cls: type = None  # Set in model_post_init to avoid circular imports
+    policy_cls: type | None = None  # Set in model_post_init to avoid circular imports
     device: str | None = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Set to your checkpoint path (local dir or use --hf_repo with serve scripts)
@@ -375,7 +376,7 @@ class SynthVLARBY1PolicyConfig(BasePolicyConfig):
 
     policy_type: str = "learned"
     action_type: str = "joint_pos_rel"
-    policy_cls: type = None
+    policy_cls: type | None = None
     device: str | None = "cuda" if torch.cuda.is_available() else "cpu"
 
     checkpoint_path: str = ""  # Set to trained checkpoint
@@ -402,6 +403,8 @@ class SynthVLARBY1PolicyConfig(BasePolicyConfig):
 
     clamp_gripper: bool = True
     gripper_representation_count: int = 1
+    states_mode: str = "cross_attn"
+    relative_max_joint_delta: list[float] | None = None
 
     def model_post_init(self, __context) -> None:
         if self.policy_cls is None:
@@ -489,9 +492,27 @@ class MolmoBotRBY1DoorOpeningPolicy(SynthVLAPolicy):
             conditioning_points=self._conditioning_points,
         )
 
-    def set_state(self, state: MolmoBotRBY1PolicyState):
+    def set_state(self, state: SynthVLAPolicyState):
         super().set_state(state)
-        self._conditioning_points = state.conditioning_points
+        self._conditioning_points = getattr(state, "conditioning_points", None)
+
+    def inference_model(self, model_input) -> dict[str, np.ndarray]:
+        """Return a buffered RBY1 action dict without Franka arm post-processing.
+
+        SynthVLAPolicy.inference_model assumes a single Franka-style "arm"
+        action key for relative-delta clipping. RB-Y1 policies emit separate
+        base, left/right arm, left/right gripper, and optional torso keys, so
+        the real-robot RB-Y1 policy path simply returns the buffered action.
+        """
+        obs = model_input[0] if isinstance(model_input, list) else model_input
+        self.obs_history.append(obs)
+        if self.buffer_index >= self.execute_horizon or not self.action_buffer:
+            self._populate_action_buffer(model_input)
+
+        action = self.action_buffer[self.buffer_index]
+        self.buffer_index += 1
+        self.step_count += 1
+        return action
 
     def _populate_action_buffer(self, observation) -> None:
         """Override to handle RBY1 obs format, fisheye warping, and point prompts."""
@@ -713,9 +734,9 @@ class MolmoBotRBY1MultitaskPolicy(MolmoBotRBY1DoorOpeningPolicy):
             conditioning_image=self._conditioning_image,
         )
 
-    def set_state(self, state: MolmoBotRBY1MultitaskPolicyState):
+    def set_state(self, state: SynthVLAPolicyState):
         super().set_state(state)
-        self._conditioning_image = state.conditioning_image
+        self._conditioning_image = getattr(state, "conditioning_image", None)
 
     def _populate_action_buffer(self, observation) -> None:
         """Override to handle torso state extraction + conditioning image."""
